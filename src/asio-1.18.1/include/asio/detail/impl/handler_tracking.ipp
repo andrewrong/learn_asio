@@ -45,7 +45,7 @@
 
 namespace asio {
 namespace detail {
-
+    // 这个类主要是用来计算时间相关的信息;
 struct handler_tracking_timestamp
 {
   uint64_t seconds;
@@ -68,12 +68,13 @@ struct handler_tracking_timestamp
   }
 };
 
+
 struct handler_tracking::tracking_state
 {
   static_mutex mutex_;
-  uint64_t next_id_;
-  tss_ptr<completion>* current_completion_;
-  tss_ptr<location>* current_location_;
+  uint64_t next_id_; //为每一个op生成唯一的id
+  tss_ptr<completion>* current_completion_; //线程局部变量，用来保存当前线程的被完成的异步op
+  tss_ptr<location>* current_location_; // 线程局部变量，用来保存当前线程被调用的异步操作的位置
 };
 
 handler_tracking::tracking_state* handler_tracking::get_state()
@@ -87,7 +88,6 @@ void handler_tracking::init()
   static tracking_state* state = get_state();
 
   state->mutex_.init();
-
   static_mutex::scoped_lock lock(state->mutex_);
   if (state->current_completion_ == 0)
     state->current_completion_ = new tss_ptr<completion>;
@@ -112,6 +112,15 @@ handler_tracking::location::~location()
     *get_state()->current_location_ = next_;
 }
 
+/**
+ * 新的async op被创建出现；
+ * execution_context: 表示当前的io_context,
+ * h: 表示当前生成的async operation_not_supported
+ * object_type: 这个op的类型，比如strand，定时器或者其他，就是对应io_object的service类型
+ * object: service的地址
+ * native_handle: 有的地方有用有的地方没用
+ * op_name: 对应op的名字，比如async_read_some,async_write
+ */
 void handler_tracking::creation(execution_context&,
     handler_tracking::tracked_handler& h,
     const char* object_type, void* object,
@@ -157,17 +166,26 @@ void handler_tracking::creation(execution_context&,
       current_id, h.id_, object_type, object, op_name);
 }
 
+/**
+ * 某一个异步操作的已经ok，目前开始要调用handler之前的会被触发的;
+ * h: 具体的某一个op操作
+ */
 handler_tracking::completion::completion(
     const handler_tracking::tracked_handler& h)
   : id_(h.id_),
     invoked_(false),
     next_(*get_state()->current_completion_)
 {
+    startTimer_ = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
   *get_state()->current_completion_ = this;
 }
 
+/**
+ * handler被调用之后，会自动释放这个对象，然后调用对应的析构函数
+ */
 handler_tracking::completion::~completion()
 {
+    uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
   if (id_)
   {
     handler_tracking_timestamp timestamp;
@@ -176,15 +194,16 @@ handler_tracking::completion::~completion()
 #if defined(ASIO_WINDOWS)
         "@asio|%I64u.%06I64u|%c%I64u|\n",
 #else // defined(ASIO_WINDOWS)
-        "@asio|%llu.%06llu|%c%llu|\n",
+        "@asio|%llu.%06llu|%c%llu|pre_ms:%llu|sum_ms:%llu\n",
 #endif // defined(ASIO_WINDOWS)
         timestamp.seconds, timestamp.microseconds,
-        invoked_ ? '!' : '~', id_);
+        invoked_ ? '!' : '~', id_, (now - this->execTimer_), (now - this->startTimer_));
   }
 
   *get_state()->current_completion_ = next_;
 }
 
+// handler被调用之前会触发
 void handler_tracking::completion::invocation_begin()
 {
   handler_tracking_timestamp timestamp;
@@ -200,6 +219,7 @@ void handler_tracking::completion::invocation_begin()
   invoked_ = true;
 }
 
+// 被调用完成之后会触发,
 void handler_tracking::completion::invocation_begin(
     const asio::error_code& ec)
 {
@@ -287,6 +307,7 @@ void handler_tracking::completion::invocation_end()
   }
 }
 
+// 某一些同步操作的会触发;
 void handler_tracking::operation(execution_context&,
     const char* object_type, void* object,
     uintmax_t /*native_handle*/, const char* op_name)
@@ -308,22 +329,34 @@ void handler_tracking::operation(execution_context&,
       timestamp.seconds, timestamp.microseconds,
       current_id, object_type, object, op_name);
 }
-
+// 如果某一些op会触发注册到reactor就会被调用;
 void handler_tracking::reactor_registration(execution_context& /*context*/,
     uintmax_t /*native_handle*/, uintmax_t /*registration*/)
 {
+  static tracking_state* state = get_state();
+  handler_tracking_timestamp timestamp;
 }
 
+// 卸载掉对应的文件句柄
 void handler_tracking::reactor_deregistration(execution_context& /*context*/,
     uintmax_t /*native_handle*/, uintmax_t /*registration*/)
 {
+    static tracking_state* state = get_state();
+  handler_tracking_timestamp timestamp;
 }
 
+// 可以分析每一次epoll触发的事件，比如read/write/other
 void handler_tracking::reactor_events(execution_context& /*context*/,
     uintmax_t /*native_handle*/, unsigned /*events*/)
 {
 }
 
+// 每一次epoll触发之后的对应处理，比如读写一些数据等;
+/**
+ * h: 对应的op的信息
+ * op_name: 操作名字
+ * ec：返回码
+ */
 void handler_tracking::reactor_operation(
     const tracked_handler& h, const char* op_name,
     const asio::error_code& ec)
